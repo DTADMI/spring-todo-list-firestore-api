@@ -1,225 +1,261 @@
 package ca.dtadmi.todolist.controller;
 
-import ca.dtadmi.todolist.entity.BaseTask;
-import ca.dtadmi.todolist.entity.Task;
-import ca.dtadmi.todolist.entity.TaskResult;
+import ca.dtadmi.todolist.dto.TaskDto;
+import ca.dtadmi.todolist.dto.TaskResultDto;
+import ca.dtadmi.todolist.entity.TaskEntity;
 import ca.dtadmi.todolist.exceptions.FirestoreExcecutionException;
+import ca.dtadmi.todolist.model.Task;
+import ca.dtadmi.todolist.service.CachingService;
+import ca.dtadmi.todolist.service.MarshallService;
 import ca.dtadmi.todolist.service.TaskService;
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.ratelimiter.annotation.RateLimiter;
+import io.github.resilience4j.retry.annotation.Retry;
+import io.github.resilience4j.timelimiter.annotation.TimeLimiter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.cache.annotation.CacheConfig;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.CachePut;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.ArrayList;
-import java.util.EnumMap;
 import java.util.List;
 import java.util.NoSuchElementException;
 
 @RestController
 @RequestMapping("/api/todolist/tasks")
+@CacheConfig(cacheNames = "tasks")
 public class TaskController {
 
+    private static final String GET_ALL_USER_TASKS = "getAllUserTasks";
+    public static final String NO_RESULT_FOUND = "No result found";
     private final Logger logger = LoggerFactory.getLogger(getClass());
     private final TaskService taskService;
+    private final CachingService cachingService;
 
-    public TaskController(TaskService taskService) {
+    private static final String CACHE_NAME = "tasks";
+    private static final String ALL_TASKS_CACHE_KEY = "allTasks";
+    private static final String USER_TASKS_CACHE_KEY = "allUserTasks";
+
+    public TaskController(TaskService taskService, CachingService cachingService) {
         this.taskService = taskService;
-    }
-
-    private TaskResult paginateResults(String page, String limit, boolean showMetadata, List<Task> tasks) {
-        List<Task> resultsData = new ArrayList<>(tasks);
-        int numberTasks = resultsData.size();
-        TaskResult results = new TaskResult();
-        results.setData(new ArrayList<>());
-
-        if("0".equals(page)) {
-            logger.debug("Pages start at 1. Rectifying the page number from 0 to 1");
-            page = "1";
-        }
-        if(!page.isBlank() && !limit.isBlank()) {
-            logger.debug("Getting sliced tasks with {} elements starting at page {}", limit, page);
-            int perPage = Integer.parseInt(limit);
-            int pageCount = Math.ceilDivExact(numberTasks, perPage);
-            int limitInt = pageCount == 0 ? 1 : Math.min(perPage, numberTasks);
-            int pageInt = pageCount == 0 ? 1 : Math.min(Integer.parseInt(page), pageCount);
-            int startIndex = (pageInt - 1) * limitInt;
-            int endIndex = (pageInt) * limitInt;
-            logger.debug("Getting sliced tasks from {} to {} excluded", startIndex, endIndex);
-
-            if(showMetadata) {
-                results.setMetadata(new TaskResult.Metadata(pageInt, perPage, pageCount, numberTasks, new EnumMap<>(TaskResult.Metadata.LinksKeys.class)));
-                String linkUriFormat = "/api/todolist/tasks?page=%d&limit=%d";
-                results.getMetadata().getLinks().put(TaskResult.Metadata.LinksKeys.SELF, String.format(linkUriFormat, pageInt, limitInt));
-                results.getMetadata().getLinks().put(TaskResult.Metadata.LinksKeys.FIRST, String.format("/api/todolist/tasks?page=1&limit=%d", limitInt));
-                results.getMetadata().getLinks().put(TaskResult.Metadata.LinksKeys.LAST, String.format(linkUriFormat, (pageCount!=0) ? pageCount : 1, limitInt));
-
-                if(startIndex > 0) {
-                    results.getMetadata().getLinks().put(TaskResult.Metadata.LinksKeys.PREVIOUS, String.format(linkUriFormat, pageInt - 1, limitInt));
-                }
-                if(endIndex < numberTasks) {
-                    results.getMetadata().getLinks().put(TaskResult.Metadata.LinksKeys.NEXT, String.format(linkUriFormat, pageInt + 1, limitInt));
-                }
-            }
-            resultsData = resultsData.subList(startIndex, endIndex);
-        }
-
-        resultsData.forEach(task -> task.setUri(String.format("/api/todolist/tasks/%s", task.getId())));
-        results.setData(resultsData);
-        return results;
+        this.cachingService = cachingService;
     }
 
     @GetMapping("")
-    public ResponseEntity<TaskResult> getTasks(@RequestParam(required = false, defaultValue = "") String page, @RequestParam(required = false, defaultValue = "") String limit, @RequestParam(required = false, defaultValue = "true") boolean showMetadata) {
+    public ResponseEntity<TaskResultDto> getTasks(@RequestParam(defaultValue = "1") String page, @RequestParam(defaultValue = "1") String limit, @RequestParam(required = false, defaultValue = "true") boolean showMetadata) {
         try {
-            TaskResult results;
-            List<Task> tasks =  taskService.findAll();
-            if(tasks.isEmpty()){
-                logger.debug("No result found");
-                return new ResponseEntity<>(HttpStatus.NO_CONTENT);
+            TaskResultDto results = (TaskResultDto) cachingService.getSingleCacheValue(CACHE_NAME, ALL_TASKS_CACHE_KEY);
+            if(results == null) {//no cached value found
+                List<Task> tasks =  taskService.findAll();
+                if(tasks.isEmpty()){
+                    logger.debug(NO_RESULT_FOUND);
+                    return new ResponseEntity<>(HttpStatus.NO_CONTENT);
+                }
+                results = MarshallService.paginateResults(page, limit, showMetadata, tasks);
+                cachingService.cacheSingleValue(CACHE_NAME, ALL_TASKS_CACHE_KEY, results);
             }
-            results = paginateResults(page, limit, showMetadata, tasks);
             return new ResponseEntity<>(results, HttpStatus.OK);
         } catch (FirestoreExcecutionException e) {
-            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+            return new ResponseEntity<>(HttpStatus.valueOf(e.getErrorCode()));
         }
     }
 
     @GetMapping("{id}")
-    public ResponseEntity<Task> getTaskById(@PathVariable String id) {
+    @Cacheable(key = "#id", unless="#result == null")
+    public ResponseEntity<TaskDto> getTaskById(@PathVariable String id) {
         try {
             if(id.isBlank()) {
                 return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
             }
-            Task result = taskService.findById(id);
+            TaskDto result = MarshallService.modelToDto(taskService.findById(id));
             if(result == null) {
-                logger.debug("No result found");
+                logger.debug(NO_RESULT_FOUND);
                 return new ResponseEntity<>(HttpStatus.NOT_FOUND);
             }
             return new ResponseEntity<>(result, HttpStatus.OK);
         } catch (FirestoreExcecutionException e) {
-            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+            return new ResponseEntity<>(HttpStatus.valueOf(e.getErrorCode()));
         }
     }
 
     @GetMapping("/name/{name}")
-    public ResponseEntity<Task> getTaskByName(@PathVariable String name) {
+    @Cacheable(key = "#name", unless="#result.statusCodeValue == 404")
+    //@CacheEvict(key = "#name", condition = "#result.statusCodeValue == 404")
+    public ResponseEntity<TaskDto> getTaskByName(@PathVariable String name) {
         try {
             if(name.isBlank()) {
                 return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
             }
-            Task result = taskService.findByName(name);
+            TaskDto result = MarshallService.modelToDto(taskService.findByName(name));
             if(result == null) {
-                logger.debug("No result found");
+                logger.debug(NO_RESULT_FOUND);
                 return new ResponseEntity<>(HttpStatus.NOT_FOUND);
             }
             return new ResponseEntity<>(result, HttpStatus.OK);
         } catch (FirestoreExcecutionException e) {
-            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+            return new ResponseEntity<>(HttpStatus.valueOf(e.getErrorCode()));
         }
     }
 
     @PostMapping("/task")
-    public ResponseEntity<Task> createTask(@RequestBody BaseTask task) {
+    public ResponseEntity<TaskDto> createTask(@RequestBody TaskEntity taskEntity) {
         try {
-            if(task==null){
+            if(taskEntity ==null){
                 return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
             }
-            Task result = taskService.create(task);
+            TaskResultDto cachedResults = ((TaskResultDto)cachingService.getSingleCacheValue(CACHE_NAME, ALL_TASKS_CACHE_KEY));
+            List<TaskDto> allTasks = (cachedResults == null || cachedResults.getData().isEmpty()) ? taskService.findAll().stream().map(MarshallService::modelToDto).toList() : cachedResults.getData();
+            if(!allTasks.isEmpty() && allTasks.stream().anyMatch(taskDto -> taskDto.getName().equals(taskEntity.getName()))){
+                logger.error("Existing name: please choose a unique name for the task");
+                return new ResponseEntity<>(HttpStatus.ALREADY_REPORTED);
+            }
+            TaskDto result = MarshallService.modelToDto(taskService.create(taskEntity));
 
             if(result == null) {
-                logger.debug("Error while creating task");
+                logger.error("Error while creating task");
                 return new ResponseEntity<>(HttpStatus.SERVICE_UNAVAILABLE);
             }
-            return new ResponseEntity<>(result, HttpStatus.OK);
+            return new ResponseEntity<>(result, HttpStatus.CREATED);
         } catch (FirestoreExcecutionException e) {
-            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+            return new ResponseEntity<>(HttpStatus.valueOf(e.getErrorCode()));
         }
     }
 
     @PostMapping("")
-    public ResponseEntity<TaskResult> getAllUserTasks(@RequestParam(required = false, defaultValue = "") String page, @RequestParam(required = false, defaultValue = "") String limit, @RequestParam(required = false, defaultValue = "true") boolean showMetadata, @RequestBody String userId) {
+    @CircuitBreaker(name= GET_ALL_USER_TASKS, fallbackMethod = "getAllUserTasksFallBack")
+    @Retry(name=GET_ALL_USER_TASKS, fallbackMethod = "getAllUserTasksFallBack")
+    @RateLimiter(name=GET_ALL_USER_TASKS, fallbackMethod = "getAllUserTasksRateLimiterFallBack")
+    @TimeLimiter(name=GET_ALL_USER_TASKS)
+    public ResponseEntity<TaskResultDto> getAllUserTasks(@RequestParam(defaultValue = "1") String page, @RequestParam(defaultValue = "1") String limit, @RequestParam(required = false, defaultValue = "true") boolean showMetadata, @RequestBody TaskEntity baseTask) {
         try {
-            if(userId.isBlank()){
+            if(baseTask==null || baseTask.getUserId().isBlank()){
                 return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
             }
-            TaskResult results;
-            List<Task> tasks =  taskService.findAllFromUser(userId);
-            if(tasks.isEmpty()){
-                logger.debug("No results found");
-                return new ResponseEntity<>(HttpStatus.NO_CONTENT);
+            String userId = baseTask.getUserId();
+            TaskResultDto results = (TaskResultDto) cachingService.getSingleCacheValue(CACHE_NAME, USER_TASKS_CACHE_KEY);
+            if(results == null) {//no cached value found
+                List<Task> tasks =  taskService.findAllFromUser(userId);
+                if(tasks.isEmpty()){
+                    logger.debug("No results found");
+                    return new ResponseEntity<>(HttpStatus.NO_CONTENT);
+                }
+                results = MarshallService.paginateResults(page, limit, showMetadata, tasks);
+                cachingService.cacheSingleValue(CACHE_NAME, USER_TASKS_CACHE_KEY, results);
             }
-            results = paginateResults(page, limit, showMetadata, tasks);
             return new ResponseEntity<>(results, HttpStatus.OK);
         } catch (FirestoreExcecutionException e) {
-            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+            return new ResponseEntity<>(HttpStatus.valueOf(e.getErrorCode()));
         }
     }
 
     @PutMapping("")
-    public ResponseEntity<Task> updateTask(@RequestBody Task taskUpdate) {
+    @CachePut(key = "#taskUpdate.id")
+    public ResponseEntity<TaskDto> updateTask(@RequestBody Task taskUpdate) {
         try {
-            if(taskUpdate==null){
+            if(taskUpdate == null || taskUpdate.getId() == null || taskUpdate.getName() == null || taskUpdate.getIsDone() == null){
                 return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
             }
-            Task result = taskService.update(taskUpdate);
+            TaskDto result = MarshallService.modelToDto(taskService.update(taskUpdate));
 
-            if(result == null) {
-                logger.debug("Error while updating task");
-                return new ResponseEntity<>(HttpStatus.SERVICE_UNAVAILABLE);
+            if (result == null) {
+                logger.error("No such record found");
+                return new ResponseEntity<>(HttpStatus.NOT_FOUND);
             }
+            cachingService.evictSingleCacheValue(CACHE_NAME, ALL_TASKS_CACHE_KEY);
+            cachingService.evictSingleCacheValue(CACHE_NAME, USER_TASKS_CACHE_KEY);
             return new ResponseEntity<>(result, HttpStatus.OK);
         } catch (FirestoreExcecutionException e) {
-            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+            logger.error("Error while updating task");
+            return new ResponseEntity<>(HttpStatus.valueOf(e.getErrorCode()));
         }
     }
 
     @PutMapping("/subtasks")
-    public ResponseEntity<Task> updateSubtasks(@RequestBody Task taskUpdate) {
+    @CachePut(key = "#taskEntityUpdate.id")
+    public ResponseEntity<TaskDto> updateSubtasks(@RequestBody Task taskEntityUpdate) {
         try {
-            if(taskUpdate==null){
+            if(taskEntityUpdate ==null || taskEntityUpdate.getId() == null || taskEntityUpdate.getName() == null || taskEntityUpdate.getIsDone() == null){
                 return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
             }
-            Task result = taskService.updateSubtasks(taskUpdate);
 
-            if(result == null) {
-                logger.debug("Error while updating task's subtasks");
-                return new ResponseEntity<>(HttpStatus.SERVICE_UNAVAILABLE);
+            TaskDto result = MarshallService.modelToDto(taskService.updateSubtasks(taskEntityUpdate));
+
+            if (result == null) {
+                logger.error("No such record found");
+                return new ResponseEntity<>(HttpStatus.NOT_FOUND);
             }
+            cachingService.evictSingleCacheValue(CACHE_NAME, ALL_TASKS_CACHE_KEY);
+            cachingService.evictSingleCacheValue(CACHE_NAME, USER_TASKS_CACHE_KEY);
             return new ResponseEntity<>(result, HttpStatus.OK);
         } catch (FirestoreExcecutionException e) {
-            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+            return new ResponseEntity<>(HttpStatus.valueOf(e.getErrorCode()));
+        }
+    }
+
+    @DeleteMapping("/deleteAll")
+    @CacheEvict(allEntries = true)
+    public ResponseEntity<TaskEntity> deleteTasks() {
+        try {
+            taskService.removeAll();
+            return new ResponseEntity<>(HttpStatus.ACCEPTED);
+        } catch (NoSuchElementException e) {
+            return new ResponseEntity<>(HttpStatus.NO_CONTENT);
+        } catch (FirestoreExcecutionException e) {
+            return new ResponseEntity<>(HttpStatus.valueOf(e.getErrorCode()));
         }
     }
 
     @DeleteMapping("{id}")
-    public ResponseEntity<Task> deleteTaskById(@PathVariable String id) {
+    @CacheEvict(key = "#id")
+    public ResponseEntity<TaskEntity> deleteTaskById(@PathVariable String id) {
         try {
             if(id.isBlank()) {
                 return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
             }
             taskService.remove(id);
+            cachingService.evictSingleCacheValue(CACHE_NAME, ALL_TASKS_CACHE_KEY);
+            cachingService.evictSingleCacheValue(CACHE_NAME, USER_TASKS_CACHE_KEY);
             return new ResponseEntity<>(HttpStatus.ACCEPTED);
         } catch (NoSuchElementException e) {
             return new ResponseEntity<>(HttpStatus.NO_CONTENT);
         } catch (FirestoreExcecutionException e) {
-            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+            return new ResponseEntity<>(HttpStatus.valueOf(e.getErrorCode()));
         }
     }
 
     @DeleteMapping("")
-    public ResponseEntity<Task> deleteTaskByName(@RequestParam(required = true, defaultValue = "") String name) {
+    @CacheEvict(key = "#name")
+    public ResponseEntity<TaskDto> deleteTaskByName(@RequestParam(defaultValue = "") String name) {
         try {
             if(name.isBlank()) {
                 return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
             }
             Task taskToDelete = taskService.findByName(name);
-            taskService.remove(taskToDelete.getId());
-            return new ResponseEntity<>(HttpStatus.ACCEPTED);
+            if(taskToDelete!=null) {
+                taskService.remove(taskToDelete.getId());
+                cachingService.evictSingleCacheValue(CACHE_NAME, ALL_TASKS_CACHE_KEY);
+                cachingService.evictSingleCacheValue(CACHE_NAME, USER_TASKS_CACHE_KEY);
+                return new ResponseEntity<>(HttpStatus.ACCEPTED);
+            }
+            return new ResponseEntity<>(HttpStatus.NOT_FOUND);
         } catch (NoSuchElementException e) {
             return new ResponseEntity<>(HttpStatus.NO_CONTENT);
         } catch (FirestoreExcecutionException e) {
-            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+            return new ResponseEntity<>(HttpStatus.valueOf(e.getErrorCode()));
         }
+    }
+
+    public ResponseEntity<String> getAllUserTasksFallBack(Exception e) {
+        logger.error(e.getMessage(), e);
+        return new ResponseEntity<>("The service is down. Please come back later.", HttpStatus.SERVICE_UNAVAILABLE);
+    }
+
+    public ResponseEntity<String> getAllUserTasksRateLimiterFallBack(Exception e) {
+        logger.error(e.getMessage(), e);
+        return new ResponseEntity<>("The service received an unusually large amount of requests. Please try again later.", HttpStatus.TOO_MANY_REQUESTS);
     }
 }

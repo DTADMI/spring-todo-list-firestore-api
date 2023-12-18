@@ -1,20 +1,13 @@
-package ca.dtadmi.todolist.entity;
+package ca.dtadmi.todolist.model;
 
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-import lombok.NonNull;
+import lombok.*;
 
-import java.util.List;
-
+@EqualsAndHashCode(callSuper = true)
 @Data
 @NoArgsConstructor
-@AllArgsConstructor
 public class Task extends BaseTask {
 
-    @NonNull
     private String id;
-    private String uri;
 
     public Task(String id){
         super();

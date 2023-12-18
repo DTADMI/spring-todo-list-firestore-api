@@ -10,4 +10,5 @@ public interface Dao<T> {
     T save(T t);
     Optional<T> update(T t);
     void delete(String id);
+    void deleteAll();
 }

@@ -1,0 +1,49 @@
+resilience4j:
+  circuitbreaker:
+    instances:
+      getAllUserTasks:
+        register-health-indicator: true
+        event-consumer-buffer-size: 100
+        automatic-transition-from-open-to-half-open-enabled: true
+        failure-rate-threshold: 50
+        minimum-number-of-calls: 50
+        permitted-number-of-calls-in-half-open-state: 30
+        sliding-window-size: 100
+        wait-duration-in-open-state:
+          nanos: 100
+        sliding-window-type: COUNT_BASED
+  retry:
+    instances:
+      getAllUserTasks:
+        max-attempts: 5
+        wait-duration:
+          nanos: 100
+  ratelimiter:
+    instances:
+      getAllUserTasks:
+        limit-for-period: 10
+        limit-refresh-period:
+          seconds: 1
+        timeout-duration:
+          nanos: 100
+        register-health-indicator: true
+        event-consumer-buffer-size: 100
+  timelimiter:
+    instances:
+      getAllUserTasks:
+        timeout-duration:
+          seconds: 2
+        cancel-running-future: false
+
+
+management:
+  health:
+    circuitbreakers:
+      enabled: true
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: always

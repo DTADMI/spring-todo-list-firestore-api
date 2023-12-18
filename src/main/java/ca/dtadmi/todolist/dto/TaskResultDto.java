@@ -1,7 +1,5 @@
-package ca.dtadmi.todolist.entity;
+package ca.dtadmi.todolist.dto;
 
-import com.fasterxml.jackson.annotation.JsonInclude;
-import com.fasterxml.jackson.annotation.JsonInclude.Include;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -14,9 +12,9 @@ import java.util.Map;
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
-public class TaskResult {
+public class TaskResultDto {
 
-    private List<Task> data;
+    private List<TaskDto> data;
     @JsonProperty("_metadata")
     private Metadata metadata;
 
@@ -47,7 +45,7 @@ public class TaskResult {
             @JsonProperty("next")
             NEXT,
             @JsonProperty("last")
-            LAST;
+            LAST
         }
 
     }

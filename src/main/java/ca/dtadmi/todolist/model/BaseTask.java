@@ -1,7 +1,9 @@
-package ca.dtadmi.todolist.entity;
+package ca.dtadmi.todolist.model;
 
-import com.fasterxml.jackson.annotation.JsonInclude;
-import lombok.*;
+import com.google.api.client.util.DateTime;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -9,23 +11,18 @@ import java.util.List;
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
-@JsonInclude(JsonInclude.Include.NON_NULL)
 public class BaseTask {
 
-    @NonNull
     private String name;
-    @NonNull
     private Boolean isDone;
-    @NonNull
-    private String creationDate;
-    private String dueDate;
+    private DateTime creationDate;
+    private DateTime dueDate;
     private List<String> subtasks;
     private String superTask;
-    private String lastModificationDate;
-    @NonNull
+    private DateTime lastModificationDate;
     private String userId;
 
-    public BaseTask(String name, Boolean isDone, String creationDate, String userId){
+    public BaseTask(String name, Boolean isDone, DateTime creationDate, String userId){
         this.name = name;
         this.isDone = isDone;
         this.creationDate = creationDate;
